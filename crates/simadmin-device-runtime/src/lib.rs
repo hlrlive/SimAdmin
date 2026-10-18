@@ -784,10 +784,31 @@ impl<'a> ModemContext<'a> {
             ));
         }
         let proxy = Proxy::new(self.connection, MM_SERVICE, self.modem_path, MM_MESSAGING).await?;
+
+        // 1. 尝试携带 storage="sm" (SIM卡物理存储) 与 SMSC 发信。
+        // 高通 410 / MSM8916 等基带固件无 ME 机身存储池，默认写入 ME 会触发 QMI 错误 47/52。
         let mut properties: HashMap<String, ZbusValue<'_>> = HashMap::new();
         properties.insert("number".to_owned(), ZbusValue::new(phone_number));
         properties.insert("text".to_owned(), ZbusValue::new(content));
-        let sms_path: OwnedObjectPath = proxy.call("Create", &(properties,)).await?;
+        properties.insert("storage".to_owned(), ZbusValue::new("sm"));
+
+        if let Some(smsc) = self.fallback_smsc().await {
+            if !smsc.is_empty() {
+                properties.insert("smsc".to_owned(), ZbusValue::new(smsc));
+            }
+        }
+
+        let sms_path: OwnedObjectPath = match proxy.call("Create", &(properties,)).await {
+            Ok(path) => path,
+            Err(_) => {
+                // 如果当前模组不支持显式声明 "sm"，回退到基础属性重试
+                let mut fallback_props: HashMap<String, ZbusValue<'_>> = HashMap::new();
+                fallback_props.insert("number".to_owned(), ZbusValue::new(phone_number));
+                fallback_props.insert("text".to_owned(), ZbusValue::new(content));
+                proxy.call("Create", &(fallback_props,)).await?
+            }
+        };
+
         let sms = Proxy::new(self.connection, MM_SERVICE, sms_path.as_str(), MM_SMS).await?;
         sms.call::<_, _, ()>("Send", &()).await?;
         Ok(sms_path.to_string())

@@ -4276,7 +4276,16 @@ fn data_path_health_from_interfaces(
         .find(|interface| {
             interface.status.eq_ignore_ascii_case("up") && has_usable_data_address(interface)
         })
-        .or_else(|| matched_interfaces.first().copied());
+        .or_else(|| matched_interfaces.first().copied())
+        .or_else(|| {
+            // 兼容性兜底：当 NetworkManager 上报控制设备名与网卡名映射脱节时，
+            // 只要系统存在已分配 IP 且处于 UP 状态的蜂窝网卡（如 wwan0），直接采信
+            interfaces.iter().find(|iface| {
+                iface.is_cellular
+                    && iface.status.eq_ignore_ascii_case("up")
+                    && has_usable_data_address(iface)
+            })
+        });
 
     let Some(interface) = selected else {
         health.reason = Some(format!(
@@ -5594,6 +5603,14 @@ pub async fn get_bearer_stats_by_interface(
             {
                 for interface_name in interface_names {
                     merge_interface_stats(&mut stats_by_interface, &interface_name, stats);
+                    // 兼容性补充：若上报端口为 wwan0qmi0 或 wwan0at0，同步映射写入底层网络接口名 wwan0
+                    if interface_name.ends_with("qmi0") || interface_name.ends_with("at0") {
+                        if let Some(base) = interface_name.strip_suffix("qmi0").or_else(|| interface_name.strip_suffix("at0")) {
+                            if !base.is_empty() {
+                                merge_interface_stats(&mut stats_by_interface, base, stats);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -6467,14 +6484,21 @@ fn nm_connection_state_is_activated(value: &str) -> bool {
 }
 
 fn parse_nm_connection_runtime_state(output: &str) -> (bool, Vec<String>) {
-    let mut values = output
-        .lines()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let profile_active = values
-        .next()
-        .is_some_and(nm_connection_state_is_activated);
-    let mut devices: Vec<String> = values
+    // nmcli -t -g 在请求多个字段时通常返回冒号分隔的单行（如 activated:wwan0qmi0:wwan0），也可能按换行分隔
+    let raw_tokens: Vec<&str> = if output.contains(':') && !output.contains('\n') {
+        output.split(':').map(str::trim).filter(|v| !v.is_empty()).collect()
+    } else {
+        output
+            .lines()
+            .flat_map(|line| line.split(':'))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .collect()
+    };
+
+    let mut iter = raw_tokens.into_iter();
+    let profile_active = iter.next().is_some_and(nm_connection_state_is_activated);
+    let mut devices: Vec<String> = iter
         .flat_map(|value| value.split(','))
         .map(str::trim)
         .filter(|value| !value.is_empty() && *value != "--")
